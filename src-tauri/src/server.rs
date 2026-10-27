@@ -46,6 +46,7 @@ pub async fn serve(listener: tokio::net::TcpListener) {
 
     let app = Router::new()
         .route("/api/devices", get(devices))
+        .route("/api/probe", get(probe))
         .route("/ws", get(ws_bridge))
         .fallback(static_file)
         .with_state(registry);
@@ -63,17 +64,27 @@ struct Target {
     port: Option<u16>,
 }
 
-async fn ws_bridge(ws: WebSocketUpgrade, Query(t): Query<Target>) -> Response {
+async fn connect_tcp(t: &Target) -> Result<TcpStream, (StatusCode, String)> {
     let addr = format!("{}:{}", t.host, t.port.unwrap_or(55555));
-    let tcp = match tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        TcpStream::connect(&addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return (StatusCode::BAD_GATEWAY, format!("{addr}: {e}")).into_response(),
-        Err(_) => return (StatusCode::GATEWAY_TIMEOUT, format!("{addr}: timeout")).into_response(),
+    match tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => Ok(s),
+        Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, format!("{addr}: {e}"))),
+        Err(_) => Err((StatusCode::GATEWAY_TIMEOUT, format!("{addr}: timed out"))),
+    }
+}
+
+/// Browsers hide why a WebSocket failed, so the UI asks here for the actual TCP error.
+async fn probe(Query(t): Query<Target>) -> Response {
+    match connect_tcp(&t).await {
+        Ok(_) => "ok".into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn ws_bridge(ws: WebSocketUpgrade, Query(t): Query<Target>) -> Response {
+    let tcp = match connect_tcp(&t).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
     };
     let _ = tcp.set_nodelay(true);
     ws.on_upgrade(move |socket| pipe(socket, tcp))

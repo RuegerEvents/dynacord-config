@@ -14,14 +14,43 @@ export async function listDevices(): Promise<Discovered[]> {
   return r.ok ? r.json() : [];
 }
 
-export async function connect(host: string, port = 55555) {
+/** Rejects if `p` doesn't settle in time. aes70.js has no per-command timeout. */
+export function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${what}: no answer after ${ms} ms`)), ms);
+    p.then(
+      (v) => (clearTimeout(t), resolve(v)),
+      (e) => (clearTimeout(t), reject(e))
+    );
+  });
+}
+
+// The KFIX30:8 occasionally drops a response during the burst of requests that
+// reading the object tree causes (~1 in 5 attempts, also on plain TCP). A good read
+// takes ~250 ms, so give up quickly and retry on a fresh connection.
+export async function connect(host: string, port = 55555, onAttempt?: (n: number) => void) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const url = `${proto}://${location.host}/ws?host=${encodeURIComponent(host)}&port=${port}`;
-  const conn = await WebSocketConnection.connect({ url });
-  const device = new RemoteDevice(conn);
-  device.set_keepalive_interval(1);
-  const roles: Map<string, any> = await device.get_role_map('/');
-  return { device, roles, conn };
+  const query = `host=${encodeURIComponent(host)}&port=${port}`;
+  const url = `${proto}://${location.host}/ws?${query}`;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    onAttempt?.(attempt);
+    const conn = await WebSocketConnection.connect({ url }).catch(async () => {
+      // The browser's error Event carries no reason; ask the server for the TCP error.
+      const r = await fetch(`/api/probe?${query}`).catch(() => null);
+      throw new Error(r ? await r.text() : 'Bridge server not reachable');
+    });
+    const device = new RemoteDevice(conn);
+    try {
+      const roles: Map<string, any> = await withTimeout(device.get_role_map('/'), 1500, 'Reading object tree');
+      device.set_keepalive_interval(1);
+      return { device, roles, conn };
+    } catch (e) {
+      lastError = e;
+      device.close();
+    }
+  }
+  throw lastError;
 }
 
 /** Subscribe to a property; callback gets the current value. Returns unsubscribe. */
