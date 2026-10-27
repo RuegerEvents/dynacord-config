@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { listDevices, connect, watch, MuteState, type Discovered } from './amp';
+  import { listDevices, connect, watch, withTimeout, MuteState, type Discovered } from './amp';
+  import Fader from './Fader.svelte';
+  import DbInput from './DbInput.svelte';
 
   type Channel = { n: number; gain: number; min: number; max: number; muted: boolean; dragging: boolean; level: any; mute: any };
 
@@ -8,6 +10,7 @@
   let manualHost = $state('');
   let status = $state<'idle' | 'connecting' | 'connected' | 'error'>('idle');
   let errorMsg = $state('');
+  let step = $state('');
   let info = $state<{ name: string; model: string; version: string; serial: string } | null>(null);
   let power = $state<boolean | null>(null);
   let flags = $state<Record<string, boolean | null>>({ ready: null, powerState: null, error: null });
@@ -40,17 +43,19 @@
     status = 'connecting';
     errorMsg = '';
     try {
-      const { device, roles, conn } = await connect(host, port);
+      const { device, roles, conn } = await connect(host, port, (n) => (step = n > 1 ? `retry ${n}` : ''));
       session = { device, conn };
-      conn.on('close', () => {
-        if (session?.conn === conn) {
-          status = 'error';
-          errorMsg = 'Connection lost';
-        }
-      });
+      const lost = (msg: string) => {
+        if (session?.conn !== conn) return;
+        disconnect();
+        status = 'error';
+        errorMsg = msg;
+      };
+      conn.on('close', () => lost('Connection lost'));
+      conn.on('error', (e: any) => lost(`Connection error: ${e?.message ?? e}`));
 
       const dm = device.DeviceManager;
-      const [md, name, serial] = await Promise.all([dm.GetModelDescription(), dm.GetDeviceName(), dm.GetSerialNumber()]);
+      const [md, name, serial] = await withTimeout(Promise.all([dm.GetModelDescription(), dm.GetDeviceName(), dm.GetSerialNumber()]), 3000, 'Device info');
       info = { name, model: `${md.Manufacturer} ${md.Name}`, version: md.Version, serial };
 
       powerObj = roles.get('device/power');
@@ -66,7 +71,7 @@
       }
       channels = chs;
       for (const ch of channels) {
-        const r = await ch.level.GetGain();
+        const r: any = await withTimeout(ch.level.GetGain(), 3000, `Channel ${ch.n}`);
         ch.min = r.values[1];
         ch.max = r.values[2];
         cleanups.push(watch(ch.level, 'Gain', (v) => { if (!ch.dragging) ch.gain = v; }));
@@ -74,6 +79,7 @@
       }
       status = 'connected';
     } catch (e: any) {
+      disconnect();
       status = 'error';
       errorMsg = e?.message ?? String(e) ?? 'Connection failed';
     }
@@ -95,16 +101,32 @@
     await powerObj.SetSetting(on).catch((e: any) => (errorMsg = `Power: ${e?.message ?? e}`));
   }
 
+  // Fader moves arrive faster than the amp needs them; send only the latest value per channel per frame.
+  const pendingGain = new Map<Channel, number>();
+  let flushQueued = false;
+
   function setGain(ch: Channel, v: number) {
     ch.gain = v;
-    ch.level.SetGain(v).catch((e: any) => console.warn(e));
+    pendingGain.set(ch, v);
+    if (flushQueued) return;
+    flushQueued = true;
+    requestAnimationFrame(() => {
+      flushQueued = false;
+      for (const [c, g] of pendingGain) c.level.SetGain(g).catch((e: any) => console.warn(e));
+      pendingGain.clear();
+    });
   }
 
-  async function toggleMute(ch: Channel) {
-    await ch.mute.SetState(ch.muted ? MuteState.Unmuted : MuteState.Muted);
+  async function setMute(ch: Channel, muted: boolean) {
+    await ch.mute.SetState(muted ? MuteState.Muted : MuteState.Unmuted);
   }
 
-  const fmt = (g: number) => (g <= -80 ? '-∞' : g.toFixed(1));
+  // "All" strip: absolute level for every channel. Shows the common value, or "—" when they differ.
+  let allGain = $derived(channels.length && channels.every((c) => c.gain === channels[0].gain) ? channels[0].gain : null);
+  let allAvg = $derived(channels.reduce((a, c) => a + c.gain, 0) / (channels.length || 1));
+  let allMuted = $derived(channels.length > 0 && channels.every((c) => c.muted));
+  let allMin = $derived(Math.max(...channels.map((c) => c.min)));
+  let allMax = $derived(Math.min(...channels.map((c) => c.max)));
 </script>
 
 <header>
@@ -130,7 +152,7 @@
       <input placeholder="IP address" bind:value={manualHost} />
       <button type="submit" disabled={status === 'connecting'}>Connect</button>
     </form>
-    {#if status === 'connecting'}<p>Connecting & reading object tree…</p>{/if}
+    {#if status === 'connecting'}<p>Connecting & reading object tree…{step ? ` (${step})` : ''}</p>{/if}
     {#if status === 'error'}<p class="err">{errorMsg}</p>{/if}
   </section>
 {:else}
@@ -154,22 +176,28 @@
     {#each channels as ch (ch.n)}
       <div class="strip" class:muted-strip={ch.muted}>
         <div class="label">Ch {ch.n}</div>
-        <div class="val">{fmt(ch.gain)} dB</div>
-        <input
-          class="fader"
-          type="range"
-          min={ch.min}
-          max={ch.max}
-          step="0.5"
-          value={ch.gain}
-          onpointerdown={() => (ch.dragging = true)}
-          onpointerup={() => (ch.dragging = false)}
-          oninput={(e) => setGain(ch, +e.currentTarget.value)}
-          ondblclick={() => setGain(ch, 0)}
-        />
-        <button class="mute" class:active={ch.muted} onclick={() => toggleMute(ch)}>MUTE</button>
+        <DbInput value={ch.gain} min={ch.min} max={ch.max} onchange={(v) => setGain(ch, v)} />
+        <Fader value={ch.gain} min={ch.min} max={ch.max} onchange={(v) => setGain(ch, v)} ondrag={(a) => (ch.dragging = a)} />
+        <button class="mute" class:active={ch.muted} onclick={() => setMute(ch, !ch.muted)}>MUTE</button>
       </div>
     {/each}
+    {#if channels.length}
+      <div class="strip all" class:muted-strip={allMuted}>
+        <div class="label">All</div>
+        <DbInput value={allGain} min={allMin} max={allMax} onchange={(v) => channels.forEach((c) => setGain(c, v))} />
+        <Fader
+          value={allGain ?? allAvg}
+          min={allMin}
+          max={allMax}
+          onchange={(v) => channels.forEach((c) => setGain(c, v))}
+          ondrag={(a) => channels.forEach((c) => (c.dragging = a))}
+        />
+        <button class="mute" class:active={allMuted} onclick={() => channels.forEach((c) => setMute(c, !allMuted))}>MUTE ALL</button>
+      </div>
+    {/if}
   </section>
-  <p class="muted hint">Double-click a fader for 0 dB. DSP (EQ, limiter, delay, presets) isn't exposed over AES70 on this amp.</p>
+  <p class="muted hint">
+    Drag, scroll or use arrow keys on a fader; double-click for 0 dB. Click a dB value to type one (<code>-inf</code> = off).
+    "All" sets every channel to the same level. DSP (EQ, limiter, delay, presets) isn't exposed over AES70 on this amp.
+  </p>
 {/if}

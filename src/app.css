@@ -26,9 +26,9 @@ input { background: #1e2126; color: inherit; border: 1px solid #3a3f48; border-r
 .strip { display: flex; flex-direction: column; align-items: center; gap: 10px; background: #1d2024; border: 1px solid #2a2e35; border-radius: 8px; padding: 12px 8px; width: 92px; }
 .strip.muted-strip { opacity: .7; }
 .label { font-weight: 600; }
-.val { font-variant-numeric: tabular-nums; font-size: 13px; color: #b9c0ca; }
-.fader { writing-mode: vertical-lr; direction: rtl; height: 260px; width: 32px; accent-color: #4c9aff; }
 .mute { width: 100%; font-size: 12px; font-weight: 700; }
 .mute.active { background: #b3261e; border-color: #d4392f; color: white; }
 .hint { margin-top: 16px; }
 .big.armed { background: #8a5a12; border-color: #b07418; }
+.strip.all { margin-left: 14px; border-color: #3d4a5c; background: #1c2330; }
+code { background: #23262b; padding: 0 4px; border-radius: 3px; }
